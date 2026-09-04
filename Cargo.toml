@@ -3,6 +3,10 @@ name = "aframp-bitcoin-custodial-wallet"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "aframp-wallet"
+path = "src/main.rs"
+
 [dependencies]
 anyhow = "1.0.104"
 bdk_bitcoind_rpc = "0.22.0"

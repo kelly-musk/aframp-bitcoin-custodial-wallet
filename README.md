@@ -14,6 +14,12 @@ Mainnet is intentionally not supported — see `Config::from_env` in [`src/confi
 
 ## Setup
 
+0. **Install the CLI** (optional — `cargo run --` below works without this):
+   ```
+   cargo install --path .
+   ```
+   This installs `aframp-wallet` to `~/.cargo/bin`. All commands below can be run as either `cargo run -- <cmd>` from the repo, or `aframp-wallet <cmd>` from anywhere once installed (it reads `.env` from the current directory either way).
+
 1. **A Bitcoin Core-compatible node** — either:
    - a local `bitcoind -regtest` for development/self-testing (no faucet, no network delay — instant `generatetoaddress`), or
    - a testnet node you have RPC access to (mainnet is rejected by the wallet).
