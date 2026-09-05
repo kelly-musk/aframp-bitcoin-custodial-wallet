@@ -325,10 +325,14 @@ fn prompt_network(default: Network) -> Result<Network> {
         Network::Regtest => "regtest",
         Network::Testnet => "testnet",
         Network::Signet => "signet",
+        Network::Bitcoin => "bitcoin",
         _ => "regtest",
     };
-    let chosen =
-        prompt::choice("Which network do you want to operate on?", &["regtest", "testnet", "signet"], default_str)?;
+    let chosen = prompt::choice(
+        "Which network do you want to operate on?",
+        &["regtest", "testnet", "signet", "bitcoin"],
+        default_str,
+    )?;
     config::parse_network(chosen)
 }
 
