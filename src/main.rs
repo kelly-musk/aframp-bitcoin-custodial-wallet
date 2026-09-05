@@ -310,7 +310,7 @@ fn cmd_balance(cfg: &Config, name: &str) -> Result<()> {
 
 fn cmd_sync(cfg: &Config, name: &str) -> Result<()> {
     let (mut ctx, _root, _kind) = open_wallet(cfg, name, cfg.network)?;
-    let client = node::rpc_client(&cfg.rpc_url, clone_auth(&cfg.rpc_auth))?;
+    let client = node::rpc_client(&cfg.rpc_url, cfg.rpc_auth.clone())?;
     node::sync(&mut ctx, &client)?;
     println!("synced. balance: {}", wallet::balance(&ctx));
     Ok(())
@@ -325,7 +325,7 @@ fn cmd_send(
     manual_select: bool,
 ) -> Result<()> {
     let (mut ctx, _root, _kind) = open_wallet(cfg, name, cfg.network)?;
-    let client = node::rpc_client(&cfg.rpc_url, clone_auth(&cfg.rpc_auth))?;
+    let client = node::rpc_client(&cfg.rpc_url, cfg.rpc_auth.clone())?;
 
     // Always sync before spending to avoid building a transaction against stale UTXOs.
     node::sync(&mut ctx, &client)?;
@@ -379,13 +379,4 @@ fn cmd_list_utxos(cfg: &Config, name: &str) -> Result<()> {
 fn cmd_rawdemo_check(cfg: &Config, name: &str) -> Result<()> {
     let (ctx, root, kind) = open_wallet(cfg, name, cfg.network)?;
     rawdemo::cross_check(&ctx, &root, cfg.network, kind)
-}
-
-fn clone_auth(auth: &bitcoincore_rpc::Auth) -> bitcoincore_rpc::Auth {
-    use bitcoincore_rpc::Auth;
-    match auth {
-        Auth::None => Auth::None,
-        Auth::UserPass(u, p) => Auth::UserPass(u.clone(), p.clone()),
-        Auth::CookieFile(p) => Auth::CookieFile(p.clone()),
-    }
 }

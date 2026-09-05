@@ -2,13 +2,24 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use bitcoin::Network;
-use bitcoincore_rpc::Auth;
+
+/// How to authenticate to the configured `BITCOIN_RPC_URL`. Plain Bitcoin Core (or most
+/// self-hosted nodes) uses `UserPass`/`CookieFile`; a hosted RPC proxy that gates access with a
+/// header — e.g. BitRPC's `X-API-Key` — needs `ApiKey` instead, which bypasses
+/// `bitcoincore_rpc`'s built-in transport (Basic Auth only) via a custom `jsonrpc` transport.
+/// See `node::rpc_client`.
+#[derive(Clone)]
+pub enum RpcAuth {
+    UserPass(String, String),
+    CookieFile(PathBuf),
+    ApiKey(String),
+}
 
 pub struct Config {
     pub network: Network,
     pub data_dir: PathBuf,
     pub rpc_url: String,
-    pub rpc_auth: Auth,
+    pub rpc_auth: RpcAuth,
 }
 
 /// Parses a network name from `.env`, a CLI flag, or an interactive prompt.
@@ -34,12 +45,15 @@ impl Config {
         let user = std::env::var("BITCOIN_RPC_USER").ok().filter(|s| !s.is_empty());
         let pass = std::env::var("BITCOIN_RPC_PASS").ok().filter(|s| !s.is_empty());
         let cookie = std::env::var("BITCOIN_RPC_COOKIE_FILE").ok().filter(|s| !s.is_empty());
+        let api_key = std::env::var("BITCOIN_RPC_API_KEY").ok().filter(|s| !s.is_empty());
 
-        let rpc_auth = match (user, pass, cookie) {
-            (Some(u), Some(p), _) => Auth::UserPass(u, p),
-            (_, _, Some(cookie_path)) => Auth::CookieFile(PathBuf::from(cookie_path)),
+        let rpc_auth = match (user, pass, cookie, api_key) {
+            (Some(u), Some(p), _, _) => RpcAuth::UserPass(u, p),
+            (_, _, Some(cookie_path), _) => RpcAuth::CookieFile(PathBuf::from(cookie_path)),
+            (_, _, _, Some(key)) => RpcAuth::ApiKey(key),
             _ => bail!(
-                "no RPC auth configured: set BITCOIN_RPC_USER + BITCOIN_RPC_PASS, or BITCOIN_RPC_COOKIE_FILE, in .env"
+                "no RPC auth configured: set BITCOIN_RPC_USER + BITCOIN_RPC_PASS, \
+                 BITCOIN_RPC_COOKIE_FILE, or BITCOIN_RPC_API_KEY, in .env"
             ),
         };
 

@@ -108,6 +108,7 @@ Derivation follows BIP44-style paths: `m/{84 or 86}'/{0 or 1}'/0'/{0=external,1=
 | `clap` | CLI argument parsing | Standard, declarative subcommands (`init`, `address`, `sync`, `send`, ...) instead of hand-rolled `std::env::args()` parsing. |
 | `dotenvy` | Loading `.env` at startup | Keeps RPC credentials and network choice out of source, per the assignment's constraint. |
 | `anyhow` | Error propagation/context throughout | Every fallible path returns `anyhow::Result` with `.context(...)`, so failures surface as one readable message instead of a panic — see `main()`'s `Err(e) => eprintln!("Error: {e:#}")`. |
+| `minreq` (+ `bitcoincore_rpc::jsonrpc`, re-exported) | `ApiKeyTransport` in [`src/node.rs`](src/node.rs) — a hand-rolled `jsonrpc::client::Transport` for RPC proxies that authenticate with a header instead of Basic Auth | `bitcoincore-rpc`'s own HTTP transport only supports Basic Auth/cookie files; `jsonrpc::client::Client::with_transport(...)` accepts any `Transport` impl, so this reuses `bitcoincore_rpc`'s method calls and types end to end and only swaps the wire layer. |
 
 ## Where I reached for raw `rust-bitcoin` instead of BDK
 
@@ -135,6 +136,13 @@ This was built and verified against regtest; if you point it at mainnet, know wh
 - **`init --force` refuses to overwrite a wallet that still holds a balance** unless you also pass `--force-confirm-loss` — it reads the existing database's balance before touching anything, so a `--force` typo on a funded wallet errors instead of orphaning funds.
 - **Pick a real fee rate.** The default is 1 sat/vB, which is fine on regtest and often fine on testnet, but can leave a mainnet transaction unconfirmed indefinitely during congestion. Check a fee estimator and pass `--fee-rate` explicitly.
 - Everything under [Known limitations](#known-limitations--what-id-improve-with-more-time) below (no RBF/CPFP, no passphrase, simplified coin selection, single-sig only) applies just as much on mainnet as on regtest — none of it was written with real value in mind.
+
+### Connecting to a hosted RPC proxy (e.g. BitRPC)
+
+Some mainnet RPC access comes via a hosted proxy that authenticates with an API key header instead of Bitcoin Core's usual Basic Auth, and only allowlists a subset of RPC methods. `BITCOIN_RPC_API_KEY` in `.env` (see [`.env.example`](.env.example)) switches the wallet to that mode — see [`src/node.rs`](src/node.rs)'s `ApiKeyTransport`, which implements `bitcoincore_rpc::jsonrpc::client::Transport` directly and hands it to `Client::from_jsonrpc(...)`, since `bitcoincore_rpc`'s own built-in transport only knows Basic Auth. Two things to set up correctly:
+
+- **`BITCOIN_RPC_URL` needs the full RPC path**, not just the host — e.g. `https://bitrpc.thebuidl.xyz/bitcoin`, because the proxy exposes Bitcoin Core's JSON-RPC under a specific route rather than at the bare URL.
+- **`sync` degrades gracefully if `getrawmempool` is blocked.** BitRPC's allowlist (at the time this was written) doesn't include it, only `getmempoolinfo` — so mempool tracking silently skips for that run (logged as a warning) rather than failing the whole sync; block sync and everything downstream of a confirmed transaction are unaffected. `getblockcount`, `getblockhash`, `getblock`, `getrawtransaction`, and `sendrawtransaction` — everything else this wallet needs — are all allowlisted.
 
 ## Known limitations / what I'd improve with more time
 
