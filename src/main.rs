@@ -144,8 +144,9 @@ fn set_active_wallet(cfg: &Config, name: &str) -> Result<()> {
 }
 
 fn load_identity(cfg: &Config, name: &str, network: Network) -> Result<(bitcoin::bip32::Xpriv, DescriptorKind)> {
+    cfg.migrate_legacy_layout(name, network)?;
     let seed = seed::load(&cfg.seed_path(name))?;
-    let kind_str = std::fs::read_to_string(cfg.kind_path(name))
+    let kind_str = std::fs::read_to_string(cfg.kind_path(name, network))
         .context("reading descriptor kind — run `init` first")?;
     let kind = DescriptorKind::from_str(kind_str.trim())?;
     let root = seed::to_root_xpriv(&seed, network)?;
@@ -159,7 +160,7 @@ fn open_wallet(
 ) -> Result<(wallet::WalletCtx, bitcoin::bip32::Xpriv, DescriptorKind)> {
     let (root, kind) = load_identity(cfg, name, network)?;
     let desc = descriptors::build(&root, network, kind)?;
-    let ctx = wallet::open_or_create(&cfg.db_path(name), network, &desc)?;
+    let ctx = wallet::open_or_create(&cfg.db_path(name, network), network, &desc)?;
     Ok((ctx, root, kind))
 }
 
@@ -195,48 +196,84 @@ fn cmd_init(
 
     match action {
         InitAction::Create { name, kind, import } => {
-            if cfg.seed_path(&name).exists() && !force {
+            cfg.migrate_legacy_layout(&name, network)?;
+
+            let seed_exists = cfg.seed_path(&name).exists();
+            let network_exists = cfg.kind_path(&name, network).exists() || cfg.db_path(&name, network).exists();
+
+            if network_exists && !force {
                 anyhow::bail!(
-                    "wallet '{name}' already exists; use --force to overwrite (WARNING: this orphans any existing funds), or pick a different --name"
+                    "wallet '{name}' already exists on {network:?}; use --force to overwrite \
+                     (WARNING: this orphans any existing funds on {network:?} only), or pick a \
+                     different --name"
                 );
             }
-            if force {
-                let old_balance = wallet::balance_of_existing_db(&cfg.db_path(&name))?;
+            if seed_exists && import.is_some() {
+                anyhow::bail!(
+                    "wallet '{name}' already has a seed (shared across networks); --import only \
+                     applies the first time this name is created"
+                );
+            }
+
+            if force && network_exists {
+                let old_balance = wallet::balance_of_existing_db(&cfg.db_path(&name, network))?;
                 if old_balance.total() != Amount::ZERO && !force_confirm_loss {
                     anyhow::bail!(
-                        "wallet '{name}' still holds a balance ({}); refusing to overwrite it. \
-                         Move those funds first, or pass --force-confirm-loss if you're certain \
-                         you want to abandon them.",
+                        "wallet '{name}' on {network:?} still holds a balance ({}); refusing to \
+                         overwrite it. Move those funds first, or pass --force-confirm-loss if \
+                         you're certain you want to abandon them.",
                         old_balance.total()
                     );
                 }
-                // A fresh seed means fresh descriptors; the old database's chain state is keyed
-                // to the old seed's descriptors and would fail to load under the new ones.
-                for path in [cfg.db_path(&name), cfg.kind_path(&name), cfg.seed_path(&name)] {
+                // Only this network's chain state/kind is reset — the seed is shared across
+                // networks for this name, so it's never touched here (regenerating it would
+                // silently break every other network already using this identity).
+                for path in [cfg.db_path(&name, network), cfg.kind_path(&name, network)] {
                     if path.exists() {
                         std::fs::remove_file(&path).with_context(|| format!("removing old {path:?}"))?;
                     }
                 }
             }
-            config::ensure_data_dir(&cfg.wallet_dir(&name))?;
+            config::ensure_data_dir(&cfg.network_dir(&name, network))?;
 
-            let seed = match import {
-                Some(phrase) => seed::import(&phrase)?,
-                None => seed::generate()?,
+            // Reuse the existing identity if this name already has one (e.g. first time using it
+            // on a new network); otherwise generate or import a fresh seed.
+            let seed = if seed_exists {
+                seed::load(&cfg.seed_path(&name))?
+            } else {
+                match import {
+                    Some(phrase) => seed::import(&phrase)?,
+                    None => seed::generate()?,
+                }
             };
             seed::save(&seed, &cfg.seed_path(&name))?;
-            std::fs::write(cfg.kind_path(&name), kind.as_str()).context("writing descriptor kind")?;
+            std::fs::write(cfg.kind_path(&name, network), kind.as_str()).context("writing descriptor kind")?;
 
             let root = seed::to_root_xpriv(&seed, network)?;
             let desc = descriptors::build(&root, network, kind)?;
-            let mut ctx = wallet::open_or_create(&cfg.db_path(&name), network, &desc)?;
+            let mut ctx = wallet::open_or_create(&cfg.db_path(&name, network), network, &desc)?;
             let (addr, _index) = wallet::new_address(&mut ctx, false)?;
 
             set_active_wallet(cfg, &name)?;
-            println!("wallet '{name}' created (kind={}, network={:?})", kind.as_str(), network);
+            println!(
+                "wallet '{name}' {} (kind={}, network={:?})",
+                if seed_exists { "extended to a new network" } else { "created" },
+                kind.as_str(),
+                network
+            );
             println!("first receive address: {addr}");
         }
         InitAction::Load { name } => {
+            cfg.migrate_legacy_layout(&name, network)?;
+            let network_exists = cfg.kind_path(&name, network).exists() || cfg.db_path(&name, network).exists();
+            if !network_exists {
+                println!("'{name}' hasn't been used on {network:?} yet — setting it up there now (same seed).");
+                let kind =
+                    DescriptorKind::from_str(prompt::choice("Descriptor type", &["wpkh", "tr"], "wpkh")?)?;
+                config::ensure_data_dir(&cfg.network_dir(&name, network))?;
+                std::fs::write(cfg.kind_path(&name, network), kind.as_str()).context("writing descriptor kind")?;
+            }
+
             let (mut ctx, _root, kind) = open_wallet(cfg, &name, network)?;
             let (addr, index) = wallet::new_address(&mut ctx, false)?;
             set_active_wallet(cfg, &name)?;

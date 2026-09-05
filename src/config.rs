@@ -33,11 +33,21 @@ pub fn parse_network(s: &str) -> Result<Network> {
     })
 }
 
+fn network_dir_name(network: Network) -> &'static str {
+    match network {
+        Network::Bitcoin => "bitcoin",
+        Network::Testnet => "testnet",
+        Network::Signet => "signet",
+        Network::Regtest => "regtest",
+        _ => "unknown",
+    }
+}
+
 impl Config {
     pub fn from_env() -> Result<Self> {
         let network = parse_network(&std::env::var("NETWORK")?)?;
-        // need to handle error here because PathBuf::from("") will return a valid path, but we want to error if the env var is not set
-        let data_dir: PathBuf = std::env::var("DATA_DIR")?.into();
+        
+        let data_dir: PathBuf = std::env::var("DATA_DIR").context("DATA_DIR must be set in .env")?.into();
 
         let rpc_url = std::env::var("BITCOIN_RPC_URL")
             .context("BITCOIN_RPC_URL must be set in .env")?;
@@ -68,17 +78,71 @@ impl Config {
         self.wallet_dir(name).join("seed.txt")
     }
 
-    pub fn kind_path(&self, name: &str) -> PathBuf {
-        self.wallet_dir(name).join("kind.txt")
+    /// Chain state (kind + database) lives one level below the wallet's identity, scoped by
+    /// network — mirrors Bitcoin Core's own `regtest/`/`testnet3/`/`signet/` subdirectories under
+    /// one datadir. The seed is the only thing shared across networks for a given wallet name;
+    /// UTXOs/checkpoints never can be, and the derivation path itself differs (coin type 0' vs
+    /// 1'), so a wallet is really a distinct set of addresses per network even from one seed.
+    pub fn network_dir(&self, name: &str, network: Network) -> PathBuf {
+        self.wallet_dir(name).join(network_dir_name(network))
     }
 
-    pub fn db_path(&self, name: &str) -> PathBuf {
-        self.wallet_dir(name).join("wallet.sqlite")
+    pub fn kind_path(&self, name: &str, network: Network) -> PathBuf {
+        self.network_dir(name, network).join("kind.txt")
+    }
+
+    pub fn db_path(&self, name: &str, network: Network) -> PathBuf {
+        self.network_dir(name, network).join("wallet.sqlite")
     }
 
     /// Remembers which wallet name to default to when a command is run without `--wallet`.
     pub fn active_marker_path(&self) -> PathBuf {
         self.data_dir.join(".active")
+    }
+
+    /// One-time migration from the pre-network-subdirectory layout (`data/<name>/kind.txt` and
+    /// `wallet.sqlite` directly), so nothing already created — mainnet funds included — gets
+    /// orphaned by moving to `data/<name>/<network>/...`. No-ops once already migrated, and never
+    /// overwrites an already-existing new-layout file.
+    ///
+    /// `requested_network` is only a fallback: the legacy database itself records which network
+    /// it was actually created under (in its `ChangeSet`), and that's what decides the target
+    /// subdirectory. A flat-layout wallet could have been created under any network regardless of
+    /// what `.env` currently says, so trusting the caller's network here would risk filing it
+    /// under the wrong one — e.g. a regtest wallet getting migrated into `bitcoin/` just because
+    /// `NETWORK` happened to be set to mainnet at the moment `migrate_legacy_layout` ran.
+    pub fn migrate_legacy_layout(&self, name: &str, requested_network: Network) -> Result<()> {
+        let old_kind = self.wallet_dir(name).join("kind.txt");
+        let old_db = self.wallet_dir(name).join("wallet.sqlite");
+        if !old_kind.exists() && !old_db.exists() {
+            return Ok(());
+        }
+
+        let network = crate::wallet::network_of_existing_db(&old_db)?.unwrap_or(requested_network);
+
+        let new_kind = self.kind_path(name, network);
+        let new_db = self.db_path(name, network);
+        if new_kind.exists() || new_db.exists() {
+            return Ok(());
+        }
+
+        ensure_data_dir(&self.network_dir(name, network))?;
+        for (old, new) in [(old_kind, new_kind), (old_db.clone(), new_db)] {
+            if old.exists() {
+                std::fs::rename(&old, &new).with_context(|| format!("migrating {old:?} to {new:?}"))?;
+            }
+        }
+        // SQLite may leave WAL/shared-memory sidecar files alongside the main database file.
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let old_side = self.wallet_dir(name).join(format!("wallet.sqlite{suffix}"));
+            if old_side.exists() {
+                let new_side = self.network_dir(name, network).join(format!("wallet.sqlite{suffix}"));
+                std::fs::rename(&old_side, &new_side)
+                    .with_context(|| format!("migrating {old_side:?} to {new_side:?}"))?;
+            }
+        }
+        log::info!("migrated wallet '{name}' to data/{name}/{network:?}/ (its actual network)");
+        Ok(())
     }
 
     /// Names of every wallet that has been initialized under `data_dir` (i.e. has a seed file).

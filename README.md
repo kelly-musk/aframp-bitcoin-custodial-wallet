@@ -83,13 +83,20 @@ Built and tested against regtest/testnet, per the assignment this was written fo
 
 ## Project / descriptor structure
 
-Each named wallet lives in its own directory, `DATA_DIR/<name>/`:
+Each named wallet lives in its own directory, `DATA_DIR/<name>/`, with chain state scoped one level further by network — mirroring Bitcoin Core's own `regtest/`/`testnet3/`/`signet/` subdirectories under one datadir:
 ```
 data/
-  alice/   seed.txt  kind.txt  wallet.sqlite
-  bob/     seed.txt  kind.txt  wallet.sqlite
+  alice/
+    seed.txt           # shared across networks — same 12 words regardless
+    regtest/  kind.txt  wallet.sqlite
+    bitcoin/  kind.txt  wallet.sqlite
+  bob/
+    seed.txt
+    testnet/  kind.txt  wallet.sqlite
   .active  # name of the wallet other commands default to when --wallet is omitted
 ```
+
+The seed is the only thing shared across networks for a given name — `init --name alice --network bitcoin` after `alice` already exists on regtest reuses the existing seed and just sets up a `bitcoin/` subdirectory alongside it (the derivation path's coin type differs, `0'` vs `1'`, so it's genuinely a different set of addresses even from the same seed). Chain state itself can never be shared, so `--force` only ever resets the network you're targeting, never the seed or another network's data. A wallet created before this layout existed (flat `data/<name>/kind.txt` + `wallet.sqlite`) is migrated into the right `<network>/` subdirectory automatically the first time it's used — determined by reading the network the database itself was actually created under, not whatever `.env` currently says (see `Config::migrate_legacy_layout` in [`src/config.rs`](src/config.rs)).
 
 Only **chain state** goes in SQLite (`bdk_wallet`'s `ChangeSet` — UTXOs, checkpoints, transactions). The private descriptor strings themselves are **not** stored; they're re-derived on every CLI invocation from that wallet's BIP39 seed (cheap and deterministic — `seed → Xpriv::new_master → "wpkh(tprv.../84'/1'/0'/{0,1}/*)"`, see [`src/seed.rs`](src/seed.rs) and [`src/descriptors.rs`](src/descriptors.rs)). This keeps the on-disk database free of key material beyond what `seed.txt` already holds, and means `Wallet::load()` is given the descriptor with `.extract_keys()` on every run to re-attach the signer.
 

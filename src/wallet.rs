@@ -61,6 +61,19 @@ pub fn list_utxos(ctx: &WalletCtx) -> Vec<LocalOutput> {
     ctx.wallet.list_unspent().collect()
 }
 
+/// Reads which network a wallet database was actually created under, without needing its seed,
+/// descriptor kind, or an assumed network in advance — used so migrating a legacy flat-layout
+/// wallet files it under the network it actually belongs to, not whatever network happens to be
+/// configured in `.env` right now. Returns `None` if there's no database yet.
+pub fn network_of_existing_db(db_path: &Path) -> Result<Option<Network>> {
+    if !db_path.exists() {
+        return Ok(None);
+    }
+    let mut conn = Connection::open(db_path).with_context(|| format!("opening {db_path:?}"))?;
+    let changeset = Connection::initialize(&mut conn).context("reading existing wallet database")?;
+    Ok(changeset.network)
+}
+
 /// Reads the balance of whatever wallet database already exists at `db_path`, without needing to
 /// know its seed, descriptor kind, or network in advance — used to check "does this hold funds"
 /// before `init --force` deletes it. Returns a zero balance if there's no database yet.
