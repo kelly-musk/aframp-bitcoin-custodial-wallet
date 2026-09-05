@@ -35,28 +35,65 @@ Mainnet is intentionally not supported — see `Config::from_env` in [`src/confi
    BITCOIN_RPC_PASS=...
    ```
 
-3. **Initialize the wallet**:
+3. **Initialize a wallet** — the CLI supports multiple named wallets side by side under `DATA_DIR`:
    ```
-   cargo run -- init                  # BIP84 wpkh, generates a fresh seed
-   cargo run -- init --kind tr        # BIP86 taproot instead
-   cargo run -- init --import "<12-word phrase>"
+   aframp-wallet init                              # interactive: create new or load existing, pick a name, kind, network
+   aframp-wallet init --name alice                 # non-interactive, BIP84 wpkh, generates a fresh seed
+   aframp-wallet init --name alice --kind tr        # BIP86 taproot instead
+   aframp-wallet init --name alice --import "<12-word phrase>"
+   aframp-wallet init --name alice --network testnet
    ```
-   This writes `data/seed.txt` (mode `0600`, plaintext BIP39 phrase — **never commit this**) and `data/wallet.sqlite`, and prints the first receive address.
+   Running `init` with no `--name` drops into prompts (create vs. load, name, descriptor kind, network) — see the recorded session below. Passing `--name` skips all prompts, for scripting.
+
+   Each named wallet gets its own `data/<name>/seed.txt` (mode `0600`, plaintext BIP39 phrase — **never commit this**) and `data/<name>/wallet.sqlite`. Whichever wallet you last created or loaded becomes the default for every other command (recorded in `data/.active`) — pass `--wallet <name>` to override it, which you'll need once more than one wallet exists.
 
 4. **Use it**:
    ```
-   cargo run -- address [--change]
-   cargo run -- sync
-   cargo run -- balance
-   cargo run -- list-utxos
-   cargo run -- send --to <addr> --amount <sats> [--fee-rate <sat/vB>] [--manual-select]
-   cargo run -- rawdemo-check
+   aframp-wallet address [--change]
+   aframp-wallet sync
+   aframp-wallet balance
+   aframp-wallet list-utxos
+   aframp-wallet send --to <addr> --amount <sats> [--fee-rate <sat/vB>] [--manual-select]
+   aframp-wallet rawdemo-check
    ```
-   `send` always runs a `sync` first, so it never builds against stale UTXOs.
+   Add `--wallet <name>` to any of these to target a specific wallet instead of the default. `send` always runs a `sync` first, so it never builds against stale UTXOs. (`cargo run --` works identically in place of `aframp-wallet` if you skipped step 0.)
+
+   Example interactive `init` session (creating a wallet named `alice`, then later reloading it):
+   ```
+   $ aframp-wallet init
+   No wallets found yet.
+   Name for the new wallet: alice
+   Descriptor type (wpkh/tr) [wpkh]:
+   Import an existing BIP39 phrase? (leave blank to generate a new one) []:
+   Which network do you want to operate on? (regtest/testnet/signet) [regtest]:
+   wallet 'alice' created (kind=wpkh, network=Regtest)
+   first receive address: bcrt1q...
+
+   $ aframp-wallet init
+   Existing wallets: alice
+   Create a new wallet or load an existing one? (create/load) [create]: load
+     1) alice
+   Which wallet do you want to load?: 1
+   Which network do you want to operate on? (regtest/testnet/signet) [regtest]:
+   wallet 'alice' loaded (kind=wpkh, network=Regtest)
+   next receive address: bcrt1q...
+
+   $ aframp-wallet balance          # no --wallet needed — alice is still the active one
+   ```
 
 ## Project / descriptor structure
 
-Only **chain state** goes in SQLite (`bdk_wallet`'s `ChangeSet` — UTXOs, checkpoints, transactions). The private descriptor strings themselves are **not** stored; they're re-derived on every CLI invocation from the BIP39 seed in `data/seed.txt` (cheap and deterministic — `seed → Xpriv::new_master → "wpkh(tprv.../84'/1'/0'/{0,1}/*)"`, see [`src/seed.rs`](src/seed.rs) and [`src/descriptors.rs`](src/descriptors.rs)). This keeps the on-disk database free of key material beyond what `data/seed.txt` already holds, and means `Wallet::load()` is given the descriptor with `.extract_keys()` on every run to re-attach the signer.
+Each named wallet lives in its own directory, `DATA_DIR/<name>/`:
+```
+data/
+  alice/   seed.txt  kind.txt  wallet.sqlite
+  bob/     seed.txt  kind.txt  wallet.sqlite
+  .active  # name of the wallet other commands default to when --wallet is omitted
+```
+
+Only **chain state** goes in SQLite (`bdk_wallet`'s `ChangeSet` — UTXOs, checkpoints, transactions). The private descriptor strings themselves are **not** stored; they're re-derived on every CLI invocation from that wallet's BIP39 seed (cheap and deterministic — `seed → Xpriv::new_master → "wpkh(tprv.../84'/1'/0'/{0,1}/*)"`, see [`src/seed.rs`](src/seed.rs) and [`src/descriptors.rs`](src/descriptors.rs)). This keeps the on-disk database free of key material beyond what `seed.txt` already holds, and means `Wallet::load()` is given the descriptor with `.extract_keys()` on every run to re-attach the signer.
+
+A wallet's network is fixed at creation (stored inside its own `ChangeSet`, not a separate file) — `Wallet::load()`'s `.check_network(...)` call cleanly rejects opening it under a different network than it was created for, which is what you'll see if `.env`'s `NETWORK` doesn't match a given wallet.
 
 Derivation follows BIP44-style paths: `m/{84 or 86}'/{0 or 1}'/0'/{0=external,1=internal}/*` — coin type `0'` for mainnet (unreachable in this wallet), `1'` for regtest/testnet/signet, purpose `84'` for `wpkh` or `86'` for `tr`.
 
@@ -94,10 +131,12 @@ let addr = Address::p2wpkh(&compressed, network);
 - **Simplified fee-rate precision** — `--fee-rate` is whole sat/vB (`bitcoin::FeeRate::from_sat_per_vb` takes `u64`), no sub-satoshi rates.
 - **`--manual-select` is a simplified heuristic** — largest-first, and doesn't iterate toward an optimal fee/change tradeoff the way `bdk_wallet`'s default coin selection algorithm does; it does correctly exclude immature coinbase UTXOs (`wallet::is_spendable_now`, verified against a real `bad-txns-premature-spend-of-coinbase` rejection during testing — see below), but for anything more sophisticated the default (non-manual) path is the better choice.
 - **`Emitter` mempool eviction tracking starts empty on every process run** (`bdk_bitcoind_rpc::NO_EXPECTED_MEMPOOL_TXS` in `node::sync`) rather than being seeded from the wallet's own previously-known unconfirmed transactions. This means eviction detection for transactions that were already unconfirmed *before* this process started is incomplete on the very first `sync` of a run; new unconfirmed activity during the run is tracked correctly.
-- **No RBF/CPFP support**, no label/metadata storage, no multi-wallet support in one process, no watch-only mode (import always expects to also sign).
+- **No RBF/CPFP support**, no label/metadata storage, no watch-only mode (import always expects to also sign). Multiple named wallets are supported (`--wallet <name>`), but a single CLI invocation still only ever acts on one of them.
 - **Single-signature only** — no multisig descriptors.
 
 ## Proof of a working transaction (regtest self-test)
+
+Recorded before the CLI grew named multi-wallet support, so `data/` here is what a single wallet's files (`data/<name>/...`) look like today — the paths moved one level deeper, nothing else about this run changed.
 
 Full walkthrough (also see the two-stage script in the plan this was built from): local `bitcoind -regtest`, `cargo run -- init`, mined 150 blocks to the wallet's first address, `sync`, `send` to the wallet's own change address, confirmed on-chain, verified independently via the node's `getrawtransaction`, then confirmed persistence survives a process restart.
 

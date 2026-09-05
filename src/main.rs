@@ -1,13 +1,14 @@
 mod config;
 mod descriptors;
 mod node;
+mod prompt;
 mod rawdemo;
 mod seed;
 mod send;
 mod wallet;
 
 use anyhow::{Context, Result};
-use bitcoin::{Address, Amount, FeeRate};
+use bitcoin::{Address, Amount, FeeRate, Network};
 use clap::{Parser, Subcommand};
 
 use config::Config;
@@ -16,22 +17,36 @@ use descriptors::DescriptorKind;
 #[derive(Parser)]
 #[command(name = "aframp-wallet", about = "A regtest/testnet Bitcoin custodial wallet")]
 struct Cli {
+    /// Which named wallet to operate on. Defaults to the one last used with `init`, or the only
+    /// one that exists; required if you have more than one.
+    #[arg(long, global = true)]
+    wallet: Option<String>,
+
     #[command(subcommand)]
     cmd: Command,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// Generate (or import) keys and create the wallet.
+    /// Generate (or import) keys and create a wallet, or load an existing one.
+    ///
+    /// Run with no flags for an interactive prompt (create new / load existing, name, network).
+    /// Pass --name to run non-interactively instead, e.g. for scripting.
     Init {
-        #[arg(long, value_enum, default_value = "wpkh")]
-        kind: DescriptorKind,
+        /// Name for the wallet to create or load. Omit this to get interactive prompts.
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long, value_enum)]
+        kind: Option<DescriptorKind>,
         /// Import an existing BIP39 mnemonic instead of generating a new one.
         #[arg(long)]
         import: Option<String>,
-        /// Overwrite an existing wallet at this data dir (WARNING: orphans any existing funds).
+        /// Overwrite an existing wallet of this name (WARNING: orphans any existing funds).
         #[arg(long)]
         force: bool,
+        /// Network to create the wallet on. Defaults to NETWORK from .env.
+        #[arg(long)]
+        network: Option<String>,
     },
     /// Print a receive (or change) address.
     Address {
@@ -77,85 +92,209 @@ fn run() -> Result<()> {
     let cfg = Config::from_env()?;
     config::ensure_data_dir(&cfg.data_dir)?;
 
+    if let Command::Init { name, kind, import, force, network } = cli.cmd {
+        return cmd_init(&cfg, name, kind, import, force, network);
+    }
+
+    let name = resolve_wallet_name(&cfg, cli.wallet.as_deref())?;
+
     match cli.cmd {
-        Command::Init { kind, import, force } => cmd_init(&cfg, kind, import, force),
-        Command::Address { change } => cmd_address(&cfg, change),
-        Command::Balance => cmd_balance(&cfg),
-        Command::Sync => cmd_sync(&cfg),
+        Command::Init { .. } => unreachable!("handled above"),
+        Command::Address { change } => cmd_address(&cfg, &name, change),
+        Command::Balance => cmd_balance(&cfg, &name),
+        Command::Sync => cmd_sync(&cfg, &name),
         Command::Send { to, amount, fee_rate, manual_select } => {
-            cmd_send(&cfg, &to, amount, fee_rate, manual_select)
+            cmd_send(&cfg, &name, &to, amount, fee_rate, manual_select)
         }
-        Command::ListUtxos => cmd_list_utxos(&cfg),
-        Command::RawdemoCheck => cmd_rawdemo_check(&cfg),
+        Command::ListUtxos => cmd_list_utxos(&cfg, &name),
+        Command::RawdemoCheck => cmd_rawdemo_check(&cfg, &name),
     }
 }
 
-fn load_identity(cfg: &Config) -> Result<(bitcoin::bip32::Xpriv, DescriptorKind)> {
-    let seed = seed::load(&cfg.seed_path())?;
-    let kind_str = std::fs::read_to_string(cfg.kind_path())
+/// Picks which wallet a non-`init` command should act on: an explicit `--wallet` flag wins,
+/// otherwise the wallet last used with `init`, otherwise the only wallet that exists.
+fn resolve_wallet_name(cfg: &Config, cli_wallet: Option<&str>) -> Result<String> {
+    if let Some(w) = cli_wallet {
+        return Ok(w.to_string());
+    }
+    if let Ok(active) = std::fs::read_to_string(cfg.active_marker_path()) {
+        let active = active.trim();
+        if !active.is_empty() {
+            return Ok(active.to_string());
+        }
+    }
+    let wallets = cfg.list_wallets()?;
+    match wallets.len() {
+        0 => anyhow::bail!("no wallet found; run `aframp-wallet init` first"),
+        1 => Ok(wallets.into_iter().next().expect("len == 1")),
+        _ => anyhow::bail!(
+            "multiple wallets exist ({}); specify one with --wallet <name>",
+            wallets.join(", ")
+        ),
+    }
+}
+
+fn set_active_wallet(cfg: &Config, name: &str) -> Result<()> {
+    std::fs::write(cfg.active_marker_path(), name).context("recording active wallet")
+}
+
+fn load_identity(cfg: &Config, name: &str, network: Network) -> Result<(bitcoin::bip32::Xpriv, DescriptorKind)> {
+    let seed = seed::load(&cfg.seed_path(name))?;
+    let kind_str = std::fs::read_to_string(cfg.kind_path(name))
         .context("reading descriptor kind — run `init` first")?;
     let kind = DescriptorKind::from_str(kind_str.trim())?;
-    let root = seed::to_root_xpriv(&seed, cfg.network)?;
+    let root = seed::to_root_xpriv(&seed, network)?;
     Ok((root, kind))
 }
 
-fn open_wallet(cfg: &Config) -> Result<(wallet::WalletCtx, bitcoin::bip32::Xpriv, DescriptorKind)> {
-    let (root, kind) = load_identity(cfg)?;
-    let desc = descriptors::build(&root, cfg.network, kind)?;
-    let ctx = wallet::open_or_create(&cfg.db_path(), cfg.network, &desc)?;
+fn open_wallet(
+    cfg: &Config,
+    name: &str,
+    network: Network,
+) -> Result<(wallet::WalletCtx, bitcoin::bip32::Xpriv, DescriptorKind)> {
+    let (root, kind) = load_identity(cfg, name, network)?;
+    let desc = descriptors::build(&root, network, kind)?;
+    let ctx = wallet::open_or_create(&cfg.db_path(name), network, &desc)?;
     Ok((ctx, root, kind))
 }
 
-fn cmd_init(cfg: &Config, kind: DescriptorKind, import: Option<String>, force: bool) -> Result<()> {
-    if cfg.seed_path().exists() && !force {
-        anyhow::bail!(
-            "wallet already initialized at {:?}; use --force to overwrite (WARNING: this orphans any existing funds)",
-            cfg.data_dir
-        );
-    }
+enum InitAction {
+    Create { name: String, kind: DescriptorKind, import: Option<String> },
+    Load { name: String },
+}
 
-    if force {
-        // A fresh seed means fresh descriptors; the old database's chain state is keyed to the
-        // old seed's descriptors and would fail to load under the new ones (descriptor mismatch).
-        for path in [cfg.db_path(), cfg.kind_path(), cfg.seed_path()] {
-            if path.exists() {
-                std::fs::remove_file(&path).with_context(|| format!("removing old {path:?}"))?;
+fn cmd_init(
+    cfg: &Config,
+    name: Option<String>,
+    kind: Option<DescriptorKind>,
+    import: Option<String>,
+    force: bool,
+    network: Option<String>,
+) -> Result<()> {
+    let interactive = name.is_none();
+
+    let action = match name {
+        Some(name) => {
+            config::validate_wallet_name(&name)?;
+            InitAction::Create { name, kind: kind.unwrap_or(DescriptorKind::Wpkh), import }
+        }
+        None => interactive_init(cfg)?,
+    };
+
+    let network = match network {
+        Some(s) => config::parse_network(&s)?,
+        None if interactive => prompt_network(cfg.network)?,
+        None => cfg.network,
+    };
+
+    match action {
+        InitAction::Create { name, kind, import } => {
+            if cfg.seed_path(&name).exists() && !force {
+                anyhow::bail!(
+                    "wallet '{name}' already exists; use --force to overwrite (WARNING: this orphans any existing funds), or pick a different --name"
+                );
             }
+            if force {
+                // A fresh seed means fresh descriptors; the old database's chain state is keyed
+                // to the old seed's descriptors and would fail to load under the new ones.
+                for path in [cfg.db_path(&name), cfg.kind_path(&name), cfg.seed_path(&name)] {
+                    if path.exists() {
+                        std::fs::remove_file(&path).with_context(|| format!("removing old {path:?}"))?;
+                    }
+                }
+            }
+            config::ensure_data_dir(&cfg.wallet_dir(&name))?;
+
+            let seed = match import {
+                Some(phrase) => seed::import(&phrase)?,
+                None => seed::generate()?,
+            };
+            seed::save(&seed, &cfg.seed_path(&name))?;
+            std::fs::write(cfg.kind_path(&name), kind.as_str()).context("writing descriptor kind")?;
+
+            let root = seed::to_root_xpriv(&seed, network)?;
+            let desc = descriptors::build(&root, network, kind)?;
+            let mut ctx = wallet::open_or_create(&cfg.db_path(&name), network, &desc)?;
+            let (addr, _index) = wallet::new_address(&mut ctx, false)?;
+
+            set_active_wallet(cfg, &name)?;
+            println!("wallet '{name}' created (kind={}, network={:?})", kind.as_str(), network);
+            println!("first receive address: {addr}");
+        }
+        InitAction::Load { name } => {
+            let (mut ctx, _root, kind) = open_wallet(cfg, &name, network)?;
+            let (addr, index) = wallet::new_address(&mut ctx, false)?;
+            set_active_wallet(cfg, &name)?;
+            println!("wallet '{name}' loaded (kind={}, network={:?})", kind.as_str(), network);
+            println!("next receive address: {addr} (index {index})");
         }
     }
-
-    let seed = match import {
-        Some(phrase) => seed::import(&phrase)?,
-        None => seed::generate()?,
-    };
-    seed::save(&seed, &cfg.seed_path())?;
-    std::fs::write(cfg.kind_path(), kind.as_str()).context("writing descriptor kind")?;
-
-    let root = seed::to_root_xpriv(&seed, cfg.network)?;
-    let desc = descriptors::build(&root, cfg.network, kind)?;
-    let mut ctx = wallet::open_or_create(&cfg.db_path(), cfg.network, &desc)?;
-    let (addr, _index) = wallet::new_address(&mut ctx, false)?;
-
-    println!("wallet initialized (kind={}, network={:?})", kind.as_str(), cfg.network);
-    println!("first receive address: {addr}");
     Ok(())
 }
 
-fn cmd_address(cfg: &Config, change: bool) -> Result<()> {
-    let (mut ctx, _root, _kind) = open_wallet(cfg)?;
+fn interactive_init(cfg: &Config) -> Result<InitAction> {
+    let existing = cfg.list_wallets()?;
+
+    let create = if existing.is_empty() {
+        println!("No wallets found yet.");
+        true
+    } else {
+        println!("Existing wallets: {}", existing.join(", "));
+        prompt::choice("Create a new wallet or load an existing one?", &["create", "load"], "create")?
+            == "create"
+    };
+
+    if create {
+        let name = loop {
+            let candidate = prompt::line("Name for the new wallet", None)?;
+            match config::validate_wallet_name(&candidate) {
+                Ok(()) if existing.contains(&candidate) => {
+                    println!("a wallet named '{candidate}' already exists")
+                }
+                Ok(()) => break candidate,
+                Err(e) => println!("{e}"),
+            }
+        };
+        let kind = DescriptorKind::from_str(prompt::choice("Descriptor type", &["wpkh", "tr"], "wpkh")?)?;
+        let phrase = prompt::line(
+            "Import an existing BIP39 phrase? (leave blank to generate a new one)",
+            Some(""),
+        )?;
+        let import = if phrase.is_empty() { None } else { Some(phrase) };
+        Ok(InitAction::Create { name, kind, import })
+    } else {
+        let name = prompt::pick("Which wallet do you want to load?", &existing)?;
+        Ok(InitAction::Load { name })
+    }
+}
+
+fn prompt_network(default: Network) -> Result<Network> {
+    let default_str = match default {
+        Network::Regtest => "regtest",
+        Network::Testnet => "testnet",
+        Network::Signet => "signet",
+        _ => "regtest",
+    };
+    let chosen =
+        prompt::choice("Which network do you want to operate on?", &["regtest", "testnet", "signet"], default_str)?;
+    config::parse_network(chosen)
+}
+
+fn cmd_address(cfg: &Config, name: &str, change: bool) -> Result<()> {
+    let (mut ctx, _root, _kind) = open_wallet(cfg, name, cfg.network)?;
     let (addr, index) = wallet::new_address(&mut ctx, change)?;
     println!("{addr} (index {index}, {})", if change { "internal/change" } else { "external/receive" });
     Ok(())
 }
 
-fn cmd_balance(cfg: &Config) -> Result<()> {
-    let (ctx, _root, _kind) = open_wallet(cfg)?;
+fn cmd_balance(cfg: &Config, name: &str) -> Result<()> {
+    let (ctx, _root, _kind) = open_wallet(cfg, name, cfg.network)?;
     println!("{}", wallet::balance(&ctx));
     Ok(())
 }
 
-fn cmd_sync(cfg: &Config) -> Result<()> {
-    let (mut ctx, _root, _kind) = open_wallet(cfg)?;
+fn cmd_sync(cfg: &Config, name: &str) -> Result<()> {
+    let (mut ctx, _root, _kind) = open_wallet(cfg, name, cfg.network)?;
     let client = node::rpc_client(&cfg.rpc_url, clone_auth(&cfg.rpc_auth))?;
     node::sync(&mut ctx, &client)?;
     println!("synced. balance: {}", wallet::balance(&ctx));
@@ -164,12 +303,13 @@ fn cmd_sync(cfg: &Config) -> Result<()> {
 
 fn cmd_send(
     cfg: &Config,
+    name: &str,
     to: &str,
     amount_sats: u64,
     fee_rate_sat_vb: Option<u64>,
     manual_select: bool,
 ) -> Result<()> {
-    let (mut ctx, _root, _kind) = open_wallet(cfg)?;
+    let (mut ctx, _root, _kind) = open_wallet(cfg, name, cfg.network)?;
     let client = node::rpc_client(&cfg.rpc_url, clone_auth(&cfg.rpc_auth))?;
 
     // Always sync before spending to avoid building a transaction against stale UTXOs.
@@ -188,8 +328,8 @@ fn cmd_send(
     Ok(())
 }
 
-fn cmd_list_utxos(cfg: &Config) -> Result<()> {
-    let (ctx, _root, _kind) = open_wallet(cfg)?;
+fn cmd_list_utxos(cfg: &Config, name: &str) -> Result<()> {
+    let (ctx, _root, _kind) = open_wallet(cfg, name, cfg.network)?;
     for utxo in wallet::list_utxos(&ctx) {
         println!(
             "{} {}  keychain={:?} spent={}",
@@ -199,8 +339,8 @@ fn cmd_list_utxos(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-fn cmd_rawdemo_check(cfg: &Config) -> Result<()> {
-    let (ctx, root, kind) = open_wallet(cfg)?;
+fn cmd_rawdemo_check(cfg: &Config, name: &str) -> Result<()> {
+    let (ctx, root, kind) = open_wallet(cfg, name, cfg.network)?;
     rawdemo::cross_check(&ctx, &root, cfg.network, kind)
 }
 
