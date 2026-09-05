@@ -114,6 +114,16 @@ fn cmd_init(cfg: &Config, kind: DescriptorKind, import: Option<String>, force: b
         );
     }
 
+    if force {
+        // A fresh seed means fresh descriptors; the old database's chain state is keyed to the
+        // old seed's descriptors and would fail to load under the new ones (descriptor mismatch).
+        for path in [cfg.db_path(), cfg.kind_path(), cfg.seed_path()] {
+            if path.exists() {
+                std::fs::remove_file(&path).with_context(|| format!("removing old {path:?}"))?;
+            }
+        }
+    }
+
     let seed = match import {
         Some(phrase) => seed::import(&phrase)?,
         None => seed::generate()?,

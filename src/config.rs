@@ -13,17 +13,15 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
-        let network = match std::env::var("NETWORK").unwrap_or_else(|_| "regtest".into()).as_str() {
+        let network = match std::env::var("NETWORK")?.as_str() {
             "regtest" => Network::Regtest,
             "testnet" => Network::Testnet,
             "signet" => Network::Signet,
-            "bitcoin" | "mainnet" => {
-                bail!("mainnet is not supported by this wallet (regtest/testnet/signet only)")
-            }
+            "bitcoin" | "mainnet" => Network::Bitcoin,
             other => bail!("unknown NETWORK '{other}' (expected regtest, testnet, or signet)"),
         };
-
-        let data_dir: PathBuf = std::env::var("DATA_DIR").unwrap_or_else(|_| "./data".into()).into();
+        // need to handle error here because PathBuf::from("") will return a valid path, but we want to error if the env var is not set
+        let data_dir: PathBuf = std::env::var("DATA_DIR").unwrap_err().into();
 
         let rpc_url = std::env::var("BITCOIN_RPC_URL")
             .context("BITCOIN_RPC_URL must be set in .env")?;
