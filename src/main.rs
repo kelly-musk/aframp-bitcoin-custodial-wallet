@@ -42,8 +42,13 @@ enum Command {
         #[arg(long)]
         import: Option<String>,
         /// Overwrite an existing wallet of this name (WARNING: orphans any existing funds).
+        /// Refused if that wallet currently holds a nonzero balance unless
+        /// --force-confirm-loss is also given.
         #[arg(long)]
         force: bool,
+        /// Required alongside --force when the wallet being overwritten holds a nonzero balance.
+        #[arg(long)]
+        force_confirm_loss: bool,
         /// Network to create the wallet on. Defaults to NETWORK from .env.
         #[arg(long)]
         network: Option<String>,
@@ -92,8 +97,8 @@ fn run() -> Result<()> {
     let cfg = Config::from_env()?;
     config::ensure_data_dir(&cfg.data_dir)?;
 
-    if let Command::Init { name, kind, import, force, network } = cli.cmd {
-        return cmd_init(&cfg, name, kind, import, force, network);
+    if let Command::Init { name, kind, import, force, force_confirm_loss, network } = cli.cmd {
+        return cmd_init(&cfg, name, kind, import, force, force_confirm_loss, network);
     }
 
     let name = resolve_wallet_name(&cfg, cli.wallet.as_deref())?;
@@ -169,6 +174,7 @@ fn cmd_init(
     kind: Option<DescriptorKind>,
     import: Option<String>,
     force: bool,
+    force_confirm_loss: bool,
     network: Option<String>,
 ) -> Result<()> {
     let interactive = name.is_none();
@@ -195,6 +201,15 @@ fn cmd_init(
                 );
             }
             if force {
+                let old_balance = wallet::balance_of_existing_db(&cfg.db_path(&name))?;
+                if old_balance.total() != Amount::ZERO && !force_confirm_loss {
+                    anyhow::bail!(
+                        "wallet '{name}' still holds a balance ({}); refusing to overwrite it. \
+                         Move those funds first, or pass --force-confirm-loss if you're certain \
+                         you want to abandon them.",
+                        old_balance.total()
+                    );
+                }
                 // A fresh seed means fresh descriptors; the old database's chain state is keyed
                 // to the old seed's descriptors and would fail to load under the new ones.
                 for path in [cfg.db_path(&name), cfg.kind_path(&name), cfg.seed_path(&name)] {
@@ -322,9 +337,31 @@ fn cmd_send(
         .map(|r| FeeRate::from_sat_per_vb(r).context("invalid fee rate"))
         .transpose()?;
 
+    if cfg.network == Network::Bitcoin {
+        confirm_mainnet_send(&addr, amount, fee_rate)?;
+    }
+
     let tx = send::build_and_sign(&mut ctx, addr, amount, fee_rate, manual_select)?;
     let txid = node::broadcast(&client, &tx)?;
     println!("broadcast: {txid}");
+    Ok(())
+}
+
+/// This is real money and a broadcast can't be undone, so mainnet sends get one last typed
+/// confirmation showing exactly what's about to happen — regtest/testnet skip this entirely so
+/// the documented scripted demo flow keeps working unattended.
+fn confirm_mainnet_send(to: &bitcoin::Address, amount: Amount, fee_rate: Option<FeeRate>) -> Result<()> {
+    println!("You are about to broadcast a MAINNET transaction:");
+    println!("  to:        {to}");
+    println!("  amount:    {amount} ({} sat)", amount.to_sat());
+    match fee_rate {
+        Some(r) => println!("  fee rate:  {r}"),
+        None => println!("  fee rate:  1 sat/vB (default — check this is reasonable for mainnet)"),
+    }
+    let answer = prompt::line("Type 'send' to broadcast, anything else to cancel", Some("cancel"))?;
+    if answer != "send" {
+        anyhow::bail!("cancelled");
+    }
     Ok(())
 }
 

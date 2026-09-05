@@ -10,7 +10,7 @@ A regtest/testnet Bitcoin custodial wallet in Rust, built on `bitcoin`, `bdk_wal
 - Persists all chain state (UTXOs, checkpoints, transactions) to SQLite, so the wallet survives being closed and reopened without a rescan from genesis.
 - Builds, signs, and broadcasts transactions, with an optional explicit largest-first coin-selection mode.
 
-Mainnet is intentionally not supported — see `Config::from_env` in [`src/config.rs`](src/config.rs). This is a **regtest/testnet toy wallet**, not production custody software (see Limitations).
+Built and tested against regtest/testnet, per the assignment this was written for — see the [Proof](#proof-of-a-working-transaction-regtest-self-test) section below. `NETWORK=mainnet` is accepted by `Config::from_env` (see [`src/config.rs`](src/config.rs)), but this is still a small, unaudited toy wallet, not production custody software — read [Using this with real funds](#using-this-with-real-mainnet-funds) before pointing it at real money.
 
 ## Setup
 
@@ -124,6 +124,17 @@ let addr = Address::p2wpkh(&compressed, network);
 **Why reach for raw `rust-bitcoin` here at all**, given BDK already does derivation correctly? Two reasons that generalize past this demo:
 1. **Trust boundary / auditability.** A descriptor string is opaque — to be sure BDK's descriptor parser is deriving what I think it's deriving (right path, right script type, right network), the only way to actually *verify* that from outside BDK's own code is to derive the same key independently with a different code path and compare. That's what this demo does.
 2. **When you need a key, not a wallet.** Anything that isn't "manage a UTXO set and build transactions" — e.g. signing an arbitrary message with a specific derived key, building a raw multisig/timelock script by hand, or deriving a key for a protocol that isn't expressible as a BDK descriptor at all — doesn't need a `Wallet`. Pulling in descriptor/PSBT machinery for that would be the wrong tool; `rust-bitcoin`'s primitives are the right layer.
+
+## Using this with real (mainnet) funds
+
+This was built and verified against regtest; if you point it at mainnet, know what you're getting into:
+
+- **Back up the seed phrase before funding the wallet.** `data/<name>/seed.txt` (mode `0600`, plaintext) is the *only* copy — write the 12 words down somewhere durable and offline. If that file is lost, the funds are unrecoverable; if it leaks, they're stolen.
+- **Test with a trivial amount first.** Send yourself a few thousand sats, confirm it round-trips (`sync`, `balance`, a `send` back out) before trusting it with anything larger.
+- **`send` requires a typed confirmation on mainnet** (`Network::Bitcoin`) — it prints the destination, amount, and fee rate and requires typing `send` to actually broadcast. Regtest/testnet skip this (so the scripted demo above stays non-interactive); this is the one thing that isn't optional on mainnet.
+- **`init --force` refuses to overwrite a wallet that still holds a balance** unless you also pass `--force-confirm-loss` — it reads the existing database's balance before touching anything, so a `--force` typo on a funded wallet errors instead of orphaning funds.
+- **Pick a real fee rate.** The default is 1 sat/vB, which is fine on regtest and often fine on testnet, but can leave a mainnet transaction unconfirmed indefinitely during congestion. Check a fee estimator and pass `--fee-rate` explicitly.
+- Everything under [Known limitations](#known-limitations--what-id-improve-with-more-time) below (no RBF/CPFP, no passphrase, simplified coin selection, single-sig only) applies just as much on mainnet as on regtest — none of it was written with real value in mind.
 
 ## Known limitations / what I'd improve with more time
 

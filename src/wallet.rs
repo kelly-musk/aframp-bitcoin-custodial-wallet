@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use bdk_wallet::chain::ChainPosition;
 use bdk_wallet::rusqlite::Connection;
-use bdk_wallet::{Balance, KeychainKind, LocalOutput, PersistedWallet, Wallet};
+use bdk_wallet::{Balance, KeychainKind, LoadParams, LocalOutput, PersistedWallet, Wallet, WalletPersister};
 use bitcoin::constants::COINBASE_MATURITY;
 use bitcoin::{Address, Network};
 
@@ -59,6 +59,20 @@ pub fn balance(ctx: &WalletCtx) -> Balance {
 
 pub fn list_utxos(ctx: &WalletCtx) -> Vec<LocalOutput> {
     ctx.wallet.list_unspent().collect()
+}
+
+/// Reads the balance of whatever wallet database already exists at `db_path`, without needing to
+/// know its seed, descriptor kind, or network in advance — used to check "does this hold funds"
+/// before `init --force` deletes it. Returns a zero balance if there's no database yet.
+pub fn balance_of_existing_db(db_path: &Path) -> Result<Balance> {
+    if !db_path.exists() {
+        return Ok(Balance::default());
+    }
+    let mut conn = Connection::open(db_path).with_context(|| format!("opening {db_path:?}"))?;
+    let changeset = Connection::initialize(&mut conn).context("reading existing wallet database")?;
+    let wallet = Wallet::load_with_params(changeset, LoadParams::new())
+        .context("reading existing wallet database")?;
+    Ok(wallet.map(|w| w.balance()).unwrap_or_default())
 }
 
 /// `list_unspent()` includes immature coinbase outputs (Core will reject a tx spending one with
